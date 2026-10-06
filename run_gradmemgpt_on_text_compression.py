@@ -35,6 +35,7 @@ logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
 def _sample_chunk(sample, max_context_length=None):
+    # select a chunk that starts from a random sentence to the end of the context
     context = sample['context']
     n_sentences = sample['n_sentences']
     word_count = sample['word_count']
@@ -43,13 +44,18 @@ def _sample_chunk(sample, max_context_length=None):
         max_context_length = word_count * 1.2
     # estimate on token counts per sentence
     token_count_per_sentence = word_count * 1.2 / n_sentences
-    # select end position to be enough to cover ~max_context_length
-    sentence_start = random.randint(0, max(0, n_sentences - 1 - int(max_context_length / token_count_per_sentence)))
-    # print(n_sentences, sentence_start, max(0, n_sentences - 1 - int(max_context_length / token_count_per_sentence)))
+    # select end position to be enough to cover ~ 3 x max_context_length
+    sentence_start = random.randint(0, max(0, n_sentences - 1 - int(3 * max_context_length / token_count_per_sentence)))
     return context[sentence_boundaries[sentence_start][0]:]
 
 
-def collate_fn(batch, tokenizer, max_context_length=None):
+def collate_fn(batch, tokenizer, special_prefix_ids, special_suffix_ids, max_context_length=None):
+    if max_context_length is None:
+        raise ValueError("max_context_length must be set for text compression collate_fn")
+    if tokenizer.pad_token_id is None:
+        raise ValueError("tokenizer.pad_token_id must be set for text compression collate_fn padding")
+
+    text_prefix_ids = tokenizer("text: ", add_special_tokens=False)["input_ids"]
     context = []
     for item in batch:
         ctx = item['context']
@@ -60,15 +66,36 @@ def collate_fn(batch, tokenizer, max_context_length=None):
             ctx = ctx[:max_context_length*15]
         context += [ctx]
 
-    context_encoded = tokenizer(context, return_tensors="pt", add_special_tokens=True,
-                                padding=True, pad_to_multiple_of=min(8, max_context_length),
-                                max_length=max_context_length, truncation=True)
-    context_input_ids = context_encoded['input_ids']
-    query_input_ids = context_input_ids
+    context_ids = tokenizer(context, add_special_tokens=False,
+                            max_length=max_context_length, truncation=True)["input_ids"]
 
-    attention_mask = context_encoded['attention_mask'].bool()
-    labels_mask = attention_mask
-    labels = context_input_ids * labels_mask + (~labels_mask) * -100
+    seq_lens = {len(x) for x in context_ids}
+    if len(seq_lens) != 1:
+        logger.warning(f"Not all contexts in batch have equal sequence length; got {sorted(seq_lens)}")
+
+    input_ids = []
+    labels = []
+    non_target_len = len(special_prefix_ids) + len(text_prefix_ids)
+    suffix_len = len(special_suffix_ids)
+
+    for ctx_ids in context_ids:
+        full_ids = special_prefix_ids + text_prefix_ids + ctx_ids + special_suffix_ids
+        labels_ids = list(full_ids)
+        labels_ids[:non_target_len] = [-100] * non_target_len
+        if suffix_len > 0:
+            labels_ids[-suffix_len:] = [-100] * suffix_len
+        input_ids += [full_ids]
+        labels += [labels_ids]
+
+    # pad
+    max_seq_len = max(len(ids) for ids in input_ids)
+    pad_token_id = tokenizer.pad_token_id
+    input_ids = [ids + [pad_token_id] * (max_seq_len - len(ids)) for ids in input_ids]
+    labels = [ids + [-100] * (max_seq_len - len(ids)) for ids in labels]
+
+    context_input_ids = torch.tensor(input_ids, dtype=torch.long)
+    query_input_ids = context_input_ids
+    labels = torch.tensor(labels, dtype=torch.long)
     return {
         'input_ids': {
             'context_input_ids': context_input_ids,
@@ -86,9 +113,19 @@ def preprocess_logits_for_metrics(eval_pred, labels):
 def compute_metrics_fn(eval_pred, tokenizer, debug_print_samples=0):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
     preds, inner_loop_stats = predictions
-    preds = preds[..., :-1]
-    # we need to predict full context, first token is predicted from memory vectors
-    labels = labels[..., :]
+    # Prefix memory predicts the first token from memory (pred_len = label_len + 1).
+    # LoRA memory without prepended seed token cannot predict the first token from memory alone
+    # in this text-compression setup, so metrics here are not directly comparable across backends.
+    pred_len = preds.shape[1]
+    label_len = labels.shape[1]
+    if pred_len == label_len + 1:
+        preds = preds[:, :-1]
+        labels = labels[:, :]
+    elif pred_len == label_len:
+        preds = preds[:, :-1]
+        labels = labels[:, 1:]
+    else:
+        raise ValueError(f"Unexpected prediction/label lengths: pred_len={pred_len}, label_len={label_len}")
 
     mask = (labels != -100)
     masked_predictions = preds[mask]
@@ -183,6 +220,7 @@ class ExperimentArgs:
     pretrained_model: Optional[str] = field(default="EleutherAI/pythia-160m")
     init_checkpoint: Optional[str] = field(default=None)
     # GradMemGPT parameters
+    memory_backend: Optional[str] = field(default="prefix")
     n_mem_tokens: Optional[int] = field(default=8)
     K: Optional[int] = field(default=2)
     last_K_second_order: Optional[int] = field(default=None)
@@ -192,15 +230,22 @@ class ExperimentArgs:
     n_ctrl_tokens: Optional[int] = field(default=0)
     inner_clip_value: Optional[float] = field(default=None)
     inner_clip_norm: Optional[float] = field(default=None)
-    use_mem_proj: Optional[bool] = field(default=True)
-    mem_proj_mode: Optional[str] = field(default="proj")
-    use_write_head: Optional[bool] = field(default=True)
-    use_write_lora: Optional[bool] = field(default=True)
+    use_mem_proj: Optional[bool] = field(default=False)
+    mem_proj_mode: Optional[str] = field(default="none")
+    use_write_head: Optional[bool] = field(default=False)
+    use_write_lora: Optional[bool] = field(default=False)
     write_lora_r: Optional[int] = field(default=8)
     write_lora_alpha: Optional[int] = field(default=16)
     write_lora_dropout: Optional[float] = field(default=0.0)
     write_lora_target_modules: Optional[str] = field(default=None)
-    freeze_backbone: Optional[bool] = field(default=True)
+    lora_mem_placement: Optional[str] = field(default="between_layers")
+    lora_mem_r: Optional[int] = field(default=8)
+    lora_mem_alpha: Optional[int] = field(default=16)
+    lora_mem_dropout: Optional[float] = field(default=0.0)
+    lora_mem_layers: Optional[str] = field(default="all")
+    lora_mem_target_modules: Optional[str] = field(default=None)
+    kv_mem_layers: Optional[str] = field(default="all")
+    freeze_backbone: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
@@ -233,6 +278,22 @@ if __name__ == '__main__':
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # infer special tokens that wrap text from add_special_tokens behavior
+    probe_raw = tokenizer("Hi", add_special_tokens=False)["input_ids"]
+    probe_full = tokenizer("Hi", add_special_tokens=True)["input_ids"]
+    start_idx = None
+    for i in range(len(probe_full) - len(probe_raw) + 1):
+        if probe_full[i:i + len(probe_raw)] == probe_raw:
+            start_idx = i
+            break
+    if start_idx is None:
+        raise ValueError(
+            "Could not infer tokenizer special-token wrapper from add_special_tokens behavior. "
+            f"probe_raw={probe_raw}, probe_full={probe_full}"
+        )
+    special_prefix_ids = probe_full[:start_idx]
+    special_suffix_ids = probe_full[start_idx + len(probe_raw):]
+
     dataset = datasets.load_from_disk(args.dataset_path)
     if not isinstance(dataset, datasets.DatasetDict):
         raise ValueError("Prepared dataset must be a DatasetDict saved with save_to_disk.")
@@ -264,6 +325,7 @@ if __name__ == '__main__':
     dataset = datasets.DatasetDict(train=train_ds, valid=eval_ds)
 
     gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model,
+                                      memory_backend=args.memory_backend,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
                                       last_K_second_order=args.last_K_second_order,
                                       lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
@@ -276,6 +338,13 @@ if __name__ == '__main__':
                                       write_lora_alpha=args.write_lora_alpha,
                                       write_lora_dropout=args.write_lora_dropout,
                                       write_lora_target_modules=args.write_lora_target_modules,
+                                      lora_mem_placement=args.lora_mem_placement,
+                                      lora_mem_r=args.lora_mem_r,
+                                      lora_mem_alpha=args.lora_mem_alpha,
+                                      lora_mem_dropout=args.lora_mem_dropout,
+                                      lora_mem_layers=args.lora_mem_layers,
+                                      lora_mem_target_modules=args.lora_mem_target_modules,
+                                      kv_mem_layers=args.kv_mem_layers,
                                       freeze_backbone=args.freeze_backbone,
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
                                       attn_implementation=args.attn_implementation,
@@ -299,7 +368,10 @@ if __name__ == '__main__':
     logger.info(f'model.dtype: {model.dtype}')
 
     def data_collator(batch):
-        return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
+        return collate_fn(batch, tokenizer,
+                          special_prefix_ids=special_prefix_ids,
+                          special_suffix_ids=special_suffix_ids,
+                          max_context_length=args.max_context_length)
 
     def compute_metrics(eval_pred):
         return compute_metrics_fn(eval_pred, tokenizer, debug_print_samples=args.debug_print_samples)
@@ -352,7 +424,7 @@ if __name__ == '__main__':
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
+                   StopOnMetricValue(metric_name='token_accuracy', value=0.99, higher_is_better=True),
                    ],
     )
 

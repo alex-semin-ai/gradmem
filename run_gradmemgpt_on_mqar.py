@@ -1,20 +1,18 @@
 import json
 import logging
 import os
-from functools import partial
 from pathlib import Path
 
 import torch
 import numpy as np
 from typing import Dict, Optional
 from dataclasses import dataclass, field
-import datasets
 
 import accelerate
 from safetensors.torch import load_file
 import transformers
 from transformers import (
-    AutoConfig, AutoTokenizer,
+    AutoConfig,
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback, TrainerCallback,
@@ -22,6 +20,7 @@ from transformers import (
 )
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
+from zoology_mqar_data import ZOOLOGY_MQAR_SOURCE, build_mqar_datasets
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -62,38 +61,36 @@ ENERGY_LANDSCAPE_STAT_KEYS = [
 TRAIN_COMPONENT_KEYS = LOSS_COMPONENT_KEYS + ENERGY_LANDSCAPE_STAT_KEYS
 
 
-def collate_fn(batch, tokenizer, max_context_length=None):
-    context = [item['context'] for item in batch]
-    query = [item['query'] + item['target'] for item in batch]
+class GradMemMQARDataset(torch.utils.data.Dataset):
+    """Expose an MQAR example through GradMem's write/read split."""
 
-    context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
-                                  padding=True, pad_to_multiple_of=8, max_length=max_context_length,
-                                  truncation=True).input_ids
-    query_encoded = tokenizer(query, return_tensors="pt", add_special_tokens=True,
-                              padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
-    query_input_ids = query_encoded['input_ids']
-    offsets_mapping = query_encoded['offset_mapping']
+    def __init__(self, dataset, context_size):
+        if context_size <= 0 or context_size >= dataset.inputs.shape[1]:
+            raise ValueError(
+                f'Invalid context_size={context_size} for input length {dataset.inputs.shape[1]}.'
+            )
+        if torch.any(dataset.labels[:, :context_size] != -100):
+            raise ValueError('MQAR labels unexpectedly supervise the KV context.')
+        self.source_dataset = dataset
+        self.context_input_ids = dataset.inputs[:, :context_size]
+        self.query_input_ids = dataset.inputs[:, context_size:]
+        self.labels = dataset.labels[:, context_size:]
 
-    # add labels_mask
-    # input_seq: 0, target_seq: 1, seq = input_seq + target_seq
-    labels_mask = torch.zeros_like(query_input_ids)
-    for i, item in enumerate(batch):
-        query_seq_len = len(item['query'])
-        target_seq_len = len(item['target'])
-        target_st, target_end = query_seq_len, query_seq_len + target_seq_len
-        # find target tokens
-        # since target is closer to the end (context, query, target), search from the end
-        in_target = False
-        for j in range(len(offsets_mapping[i]) - 1, -1, -1):
-            st, end = offsets_mapping[i][j]
-            # if (target_st, target_end) intersects with (st, end), it is a target token
-            if st < target_end and end > target_st:
-                labels_mask[i, j] = 1
-                in_target = True
-            elif in_target:
-                break
+    def __len__(self):
+        return len(self.source_dataset)
 
-    labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
+    def __getitem__(self, index):
+        return {
+            'context_input_ids': self.context_input_ids[index],
+            'query_input_ids': self.query_input_ids[index],
+            'labels': self.labels[index],
+        }
+
+
+def collate_fn(batch):
+    context_input_ids = torch.stack([item['context_input_ids'] for item in batch])
+    query_input_ids = torch.stack([item['query_input_ids'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
     return {
         'input_ids': {
             'context_input_ids': context_input_ids,
@@ -111,8 +108,36 @@ def tensor_batch_to_numpy(batch):
     return batch
 
 
-def collate_fn_numpy(batch, tokenizer, max_context_length=None):
-    return tensor_batch_to_numpy(collate_fn(batch, tokenizer, max_context_length=max_context_length))
+def collate_fn_numpy(batch):
+    return tensor_batch_to_numpy(collate_fn(batch))
+
+
+class MQARGradMemGPT(GradMemGPT):
+    """GradMemGPT with an exact MQAR vocabulary and query-position loss."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        expected_vocab_size = config.mqar_vocab_size
+        actual_vocab_size = self.model.config.vocab_size
+        if actual_vocab_size != expected_vocab_size:
+            raise ValueError(
+                f'Base model vocabulary size {actual_vocab_size} does not match '
+                f'MQAR vocab_size {expected_vocab_size}.'
+            )
+
+        # GradMem uses token 0 as an internal padding sentinel. It cannot occur
+        # in the initial KV context, but sparse MQAR may use it as an attended
+        # filler in the read sequence, so keep its embedding trainable.
+        embeddings = self.model.get_input_embeddings()
+        if embeddings.padding_idx == 0:
+            embeddings.padding_idx = None
+            if not config.mqar_dense_queries:
+                initializer_range = getattr(self.model.config, 'initializer_range', 0.02)
+                with torch.no_grad():
+                    embeddings.weight[0].normal_(mean=0.0, std=initializer_range)
+        self.model.config.pad_token_id = 0
+        self.model.config.bos_token_id = None
+        self.model.config.eos_token_id = None
 
 
 def preprocess_logits_for_metrics(eval_pred, labels):
@@ -121,66 +146,75 @@ def preprocess_logits_for_metrics(eval_pred, labels):
     return (logits.argmax(dim=-1), inner_loop_stats)
 
 
-def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
+class ConsoleEvalMetricsCallback(TrainerCallback):
+    """Print every evaluation as a durable rank-zero console line."""
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if state.is_world_process_zero and metrics:
+            print(
+                f'eval step {state.global_step}: '
+                f'{json.dumps(metrics, sort_keys=True, default=float)}',
+                flush=True,
+            )
+
+
+def compute_metrics_fn(eval_pred):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
     preds, inner_loop_stats = predictions
     pred_len = preds.shape[1]
     label_len = labels.shape[1]
     if pred_len == label_len + 1:
-        preds = preds[:, :-1]
-        labels = labels[:, :]
-    elif pred_len == label_len:
-        preds = preds[:, :-1]
-        labels = labels[:, 1:]
-    else:
-        raise ValueError(f"Unexpected prediction/label lengths: pred_len={pred_len}, label_len={label_len}")
+        # Prefix memory returns one pre-query logit before logits at query positions.
+        preds = preds[:, 1:]
+    elif pred_len != label_len:
+        raise ValueError(
+            f'Unexpected prediction/label lengths: pred_len={pred_len}, label_len={label_len}'
+        )
 
-    # Create a mask for tokens that are not padding (-100) and ignored tokens (like ! and |)
-    mask = (labels != -100)
-    for t_id in ignore_token_ids:
-        mask &= (labels != t_id)
+    mask = labels != -100
+    if not np.all(mask.any(axis=1)):
+        raise ValueError('Every MQAR example must contain at least one supervised query.')
 
-    # Calculate token-level accuracy only on content tokens
-    masked_predictions = preds[mask]
-    masked_labels = labels[mask]
+    correct = preds[mask] == labels[mask]
+    token_accuracy = float(correct.mean())
+    per_example_token_accuracy = [
+        (pred[example_mask] == label[example_mask]).mean()
+        for pred, label, example_mask in zip(preds, labels, mask)
+    ]
+    all_queries_exact_match = [
+        np.all(pred[example_mask] == label[example_mask])
+        for pred, label, example_mask in zip(preds, labels, mask)
+    ]
 
-    accuracy = (masked_predictions == masked_labels).mean()
-
-    # get exact_match per-sample accuracy, ignore masked tokens
-    # predictions.shape = (batch_size, seq_len)
-    exact_match = np.mean([
-        np.all(pred[mask[i]] == lab[mask[i]])
-        for i, (pred, lab) in enumerate(zip(preds, labels))
-        if np.any(mask[i])  # Skip samples that are all masked
-    ])
-
-    for pred, label, inp_c, inp_q in zip(preds[:5], labels[:5],
-                                         inputs['context_input_ids'][:5], inputs['query_input_ids'][:5]):
-        mask = (label != -100)
-        pred = pred[mask]
-        inp_c[inp_c == -100] = tokenizer.pad_token_id
-        inp_q[inp_q == -100] = tokenizer.pad_token_id
-        label[label == -100] = tokenizer.pad_token_id
-        print('i:', tokenizer.decode(np.concatenate([inp_c, inp_q]), skip_special_tokens=True).strip())
-        print('p:', tokenizer.decode(pred, skip_special_tokens=True).strip())
-        print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
+    for pred, label, inp_c, inp_q, example_mask in zip(
+        preds[:5], labels[:5], inputs['context_input_ids'][:5],
+        inputs['query_input_ids'][:5], mask[:5]
+    ):
+        print('i:', np.concatenate([inp_c, inp_q]).tolist())
+        print('q:', np.asarray(inp_q[example_mask]).tolist())
+        print('p:', np.asarray(pred[example_mask]).tolist())
+        print('t:', np.asarray(label[example_mask]).tolist())
         print('-' * 50)
 
     metrics = {
-        "token_accuracy": float(accuracy),
-        "exact_match": float(exact_match),
-        "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
-        "inner_grad_norm": float(inner_loop_stats['inner_grad_norm_mean'].mean()),
-        "inner_grad_norm_max": float(inner_loop_stats['inner_grad_norm_max'].max()),
-        "inner_grad_norm_min": float(inner_loop_stats['inner_grad_norm_min'].min()),
-        "mem_norm_mean": float(inner_loop_stats['mem_norm_mean'].mean()),
-        "mem_norm_max": float(inner_loop_stats['mem_norm_max'].max()),
-        "mem_norm_min": float(inner_loop_stats['mem_norm_min'].min()),
-        "delta_mem_norm_mean": float(inner_loop_stats['delta_mem_norm_mean'].mean()),
-        "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
-        "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
+        # Every MQAR answer is one token, so per-query EM equals token accuracy.
+        'token_accuracy': token_accuracy,
+        'exact_match': token_accuracy,
+        'all_queries_token_accuracy': float(np.mean(per_example_token_accuracy)),
+        'all_queries_exact_match': float(np.mean(all_queries_exact_match)),
     }
-    for key in [
+    if 'inner_grad_norm_mean' in inner_loop_stats:
+        metrics['inner_grad_norm'] = float(
+            np.asarray(inner_loop_stats['inner_grad_norm_mean']).mean()
+        )
+
+    mean_stats = [
+        'inner_loss',
+        'inner_grad_norm',
+        'inner_grad_norm_mean',
+        'mem_norm_mean',
+        'delta_mem_norm_mean',
+        'mem_attn_read',
         'inner_loss_after_write',
         'inner_loss_initial',
         'inner_loss_write_delta',
@@ -190,12 +224,18 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         'inner_energy_loss_after_write',
         'write_reconstruction_weight',
         'write_energy_weight',
-    ] + TRAIN_COMPONENT_KEYS:
+    ] + TRAIN_COMPONENT_KEYS
+    max_stats = ['inner_grad_norm_max', 'mem_norm_max', 'delta_mem_norm_max']
+    min_stats = ['inner_grad_norm_min', 'mem_norm_min', 'delta_mem_norm_min']
+    for key in mean_stats:
         if key in inner_loop_stats:
-            value = inner_loop_stats[key]
-            metrics[key] = float(value.mean() if hasattr(value, 'mean') else value)
-    if 'mem_attn_read' in inner_loop_stats:
-        metrics['mem_attn_read'] = float(inner_loop_stats['mem_attn_read'].mean())
+            metrics[key] = float(np.asarray(inner_loop_stats[key]).mean())
+    for key in max_stats:
+        if key in inner_loop_stats:
+            metrics[key] = float(np.asarray(inner_loop_stats[key]).max())
+    for key in min_stats:
+        if key in inner_loop_stats:
+            metrics[key] = float(np.asarray(inner_loop_stats[key]).min())
     return metrics
 
 
@@ -283,8 +323,19 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(default='./data/N2-K4V4-S4(32-64)_1M')
-    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
+    vocab_size: Optional[int] = field(default=8192)
+    input_seq_len: Optional[int] = field(default=24)
+    num_kv_pairs: Optional[int] = field(default=8)
+    train_num_examples: Optional[int] = field(default=100_000)
+    valid_num_examples: Optional[int] = field(default=3_000)
+    power_a: Optional[float] = field(default=0.01)
+    random_non_queries: Optional[bool] = field(default=False)
+    data_seed: Optional[int] = field(default=123)
+    dense_queries: Optional[bool] = field(default=True)
+    query_sampling: Optional[str] = field(
+        default='uniform',
+        metadata={'help': 'Dense query sampling: uniform, power_law, or zoology.'},
+    )
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -305,7 +356,7 @@ class ExperimentArgs:
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
-    max_context_length: Optional[int] = field(default=None)
+    max_position_embeddings: Optional[int] = field(default=1024)
     # GradMemGPT parameters
     memory_backend: Optional[str] = field(default="prefix")
     n_mem_tokens: Optional[int] = field(default=8)
@@ -357,7 +408,6 @@ if __name__ == '__main__':
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
     logger = get_logger('')
-    # datasets.utils.logging.set_verbosity(logger.log_level)
     transformers.utils.logging.set_verbosity(log_lvl)
 
     logger.info(f'num processes: {accel.num_processes}')
@@ -365,18 +415,67 @@ if __name__ == '__main__':
     logger.info(f'accelerator state: {accel.state}')
 
     assert not (args.pretrained_model is not None and args.base_model is not None), "only one of these args must be set"
+    if args.pretrained_model is not None and args.init_base_checkpoint is not None:
+        raise ValueError('pretrained_model and init_base_checkpoint are mutually exclusive.')
+
+    source_train, source_valid, train_data_seed, valid_data_seed = build_mqar_datasets(
+        vocab_size=args.vocab_size,
+        input_seq_len=args.input_seq_len,
+        num_kv_pairs=args.num_kv_pairs,
+        train_num_examples=args.train_num_examples,
+        valid_num_examples=args.valid_num_examples,
+        power_a=args.power_a,
+        random_non_queries=args.random_non_queries,
+        data_seed=args.data_seed,
+        dense_queries=args.dense_queries,
+        query_sampling=args.query_sampling,
+    )
+    context_size = args.num_kv_pairs * 2
+    train_dataset = GradMemMQARDataset(source_train, context_size=context_size)
+    valid_dataset = GradMemMQARDataset(source_valid, context_size=context_size)
+    output_dir = Path(args.exp_path)
 
     if accel.is_main_process:
         config = {
             'cli_args': dict(vars(args)),
+            'task_source': ZOOLOGY_MQAR_SOURCE,
+            'task': 'Zoology MQAR with GradMem write/read split',
+            'query_layout': (
+                'dense context and contiguous query keys; no fillers'
+                if args.dense_queries else
+                'upstream power-law query placement'
+            ),
+            'query_sampling': source_train.slices.get('query_sampling'),
+            'data_generator': source_train.slices.get('generator', 'upstream'),
+            'query_distribution': source_train.slices.get(
+                'query_distribution', 'power_law_placement'
+            ),
+            'effective_power_a': source_train.slices.get('effective_power_a', args.power_a),
+            'loss_alignment': 'query-position read loss; generated labels are unchanged',
+            'context_size': context_size,
+            'query_size': args.input_seq_len - context_size,
+            'train_data_seed': train_data_seed,
+            'valid_data_seed': valid_data_seed,
+            'checkpoint_source': (
+                {'type': 'pretrained_model', 'path': args.pretrained_model}
+                if args.pretrained_model is not None else
+                {'type': 'init_base_checkpoint', 'path': args.init_base_checkpoint}
+                if args.init_base_checkpoint is not None else
+                {'type': 'scratch', 'base_model': args.base_model}
+            ),
+            'init_gradmem_checkpoint': args.init_checkpoint,
+            'metrics': [
+                'token_accuracy',
+                'exact_match',
+                'all_queries_token_accuracy',
+                'all_queries_exact_match',
+            ],
         }
         logger.info(f'saving experiment configuration to {args.exp_path}')
-        Path(args.exp_path).mkdir(parents=True)
-        json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
+        output_dir.mkdir(parents=True)
+        json.dump(config, open(output_dir / 'config.json', 'w'), indent=4)
 
     if args.pretrained_model is None:
-        # create tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
         # create base model config
         if args.init_base_checkpoint is not None:
             checkpoint_dir = Path(args.init_base_checkpoint).resolve().parent
@@ -384,18 +483,26 @@ if __name__ == '__main__':
             if not checkpoint_config.is_file():
                 raise FileNotFoundError(f'Base checkpoint config does not exist: {checkpoint_config}')
             config = AutoConfig.from_pretrained(checkpoint_dir)
+            if config.vocab_size != args.vocab_size:
+                raise ValueError(
+                    f'Base checkpoint vocabulary size {config.vocab_size} does not match '
+                    f'MQAR vocab_size {args.vocab_size}.'
+                )
             logger.info(f'Building the base model from checkpoint config: {checkpoint_config}')
         elif args.base_model == 'gpt2':
             config = AutoConfig.from_pretrained('gpt2')
             config.n_layer = args.n_layer
             config.n_head = args.n_head
             config.n_embd = args.n_embd
+            config.n_positions = args.max_position_embeddings
+            config.n_ctx = args.max_position_embeddings
         elif args.base_model == 'pythia':
             config = AutoConfig.from_pretrained('EleutherAI/pythia-160m')
             config.num_hidden_layers = args.n_layer
             config.num_attention_heads = args.n_head
             config.hidden_size = args.n_embd
             config.intermediate_size = config.hidden_size * 4
+            config.max_position_embeddings = args.max_position_embeddings
         elif args.base_model == 'llama':
             config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
             config.num_hidden_layers = args.n_layer
@@ -404,20 +511,26 @@ if __name__ == '__main__':
             config.hidden_size = args.n_embd
             config.head_dim = config.hidden_size // config.num_attention_heads
             config.intermediate_size = config.hidden_size * 4
+            config.rope_scaling = None
+            config.rope_theta = 10000.0
+            config.max_position_embeddings = args.max_position_embeddings
         else:
             raise ValueError(f'Unsupported base model: {args.base_model}')
 
         config.torch_dtype = "float32"  # weights in float32, at training precision is controlled by accelerate
-        config.vocab_size = tokenizer.vocab_size
-        config.pad_token_id = tokenizer.pad_token_id
-        config.bos_token_id = tokenizer.bos_token_id
-        config.eos_token_id = tokenizer.eos_token_id
+        config.vocab_size = args.vocab_size
+        config.pad_token_id = 0
+        config.bos_token_id = None
+        config.eos_token_id = None
         config.use_cache = False
     else:
         config = None
-        tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+        pretrained_config = AutoConfig.from_pretrained(args.pretrained_model)
+        if pretrained_config.vocab_size != args.vocab_size:
+            raise ValueError(
+                f'Pretrained model vocabulary size {pretrained_config.vocab_size} does not match '
+                f'MQAR vocab_size {args.vocab_size}.'
+            )
 
     gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
                                       memory_backend=args.memory_backend,
@@ -455,15 +568,18 @@ if __name__ == '__main__':
                                       energy_mix_alpha=args.energy_mix_alpha,
                                       energy_anchor_weight=args.energy_anchor_weight,
                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,
-                                      inner_loss_weight=args.inner_loss_weight)
+                                      inner_loss_weight=args.inner_loss_weight,
+                                      read_loss_alignment='query_position',
+                                      mqar_vocab_size=args.vocab_size,
+                                      mqar_dense_queries=args.dense_queries)
 
     # Create gradmemgpt model
-    model = GradMemGPT(gradmem_config)
+    model = MQARGradMemGPT(gradmem_config)
 
     model_to_init_from_ckpt = None
+    state_dict = None
     if args.init_checkpoint is not None:
         model_to_init_from_ckpt = model
-        init_ckpt_path = args.init_checkpoint
         state_dict = load_file(args.init_checkpoint)
         if args.memory_backend == 'prefix' and 'mem' in state_dict and getattr(model, 'mem', None) is not None:
             ckpt_mem = state_dict['mem']
@@ -482,9 +598,9 @@ if __name__ == '__main__':
                     )
     elif args.init_base_checkpoint is not None:
         model_to_init_from_ckpt = model.model
-        init_ckpt_path = args.init_base_checkpoint
+        state_dict = load_file(args.init_base_checkpoint)
     if model_to_init_from_ckpt is not None:
-        missing_k, unexpected_k = model_to_init_from_ckpt.load_state_dict(load_file(init_ckpt_path), strict=False)
+        missing_k, unexpected_k = model_to_init_from_ckpt.load_state_dict(state_dict, strict=False)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
         if len(unexpected_k) != 0:
@@ -496,21 +612,10 @@ if __name__ == '__main__':
     logger.info(f'model config: {model.config}')
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
+    logger.info(f'train examples: {len(train_dataset)}; valid examples: {len(valid_dataset)}')
 
-    dataset = datasets.load_from_disk(args.data_path)
     # use collate_fn_numpy if no GPU is available, allows running with 'mps' device on Apple M chips
-    collator_fn = collate_fn if torch.cuda.is_available() else collate_fn_numpy
-    data_collator = partial(collator_fn, tokenizer=tokenizer, max_context_length=args.max_context_length)
-
-    # Target sequence looks like: "XXXX!|"
-    # Let's not count ! and | in the accuracy calculation
-    ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']]
-
-    # Define custom compute metrics function with ignored tokens
-    def compute_metrics(eval_pred):
-        return compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
-
-    output_dir = Path(args.exp_path)
+    data_collator = collate_fn if torch.cuda.is_available() else collate_fn_numpy
 
     if args.total_batch_size is None:
         args.total_batch_size = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
@@ -556,20 +661,21 @@ if __name__ == '__main__':
     trainer = CustomTrainer(
         model=model,
         args=training_args,
-        train_dataset=dataset['train'],
-        eval_dataset=dataset['valid'],
+        train_dataset=train_dataset,
+        eval_dataset=valid_dataset,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics_fn,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=args.stop_on_metric_value,
+        callbacks=[ConsoleEvalMetricsCallback(),
+                   EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
+                   StopOnMetricValue(metric_name='all_queries_exact_match', value=args.stop_on_metric_value,
                                      higher_is_better=True),
                    ],
     )
     # Train the model
     trainer.train()
     logger.info('training done. running final evaluation...')
-    metrics = trainer.evaluate(dataset['valid'])
+    metrics = trainer.evaluate(valid_dataset)
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
     trainer.state.save_to_json(output_dir / 'trainer_state.json')

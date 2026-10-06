@@ -7,27 +7,45 @@ source "$SCRIPT_DIR/collect_env_state.sh"
 
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
-LR=1e-04
+LR=${LR:-1e-04}
 TBS=64
 PER_DEVICE_BATCH_SIZE=64
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 
 L=4
 H=4
-D=128
+D=256
 BASE_MODEL=llama
 
-V=62
-# Dataset parameters
-# DATA_NAME="N2-K4V4-S4(32-64)_1M"
-# DATA_NAME="N2-K4V4-S1(16-32)_1M"
-# DATA_NAME="N2-K4V4-S2(16-32)_1M"
-# DATA_NAME="N0-S1(4-4)_1M"
-# DATA_NAME="N10-K2V2-S4(32-64)_1M"
-# DATA_NAME="N16-K1V1-vocab512_1M"
-DATA_NAME="N8-K2V2-V${V}_1M"
-DATA_PATH="./data/${DATA_NAME}"
-TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
+# Dense MQAR query-order distribution.
+VOCAB_SIZE=8192
+NUM_KV_PAIRS=16
+INPUT_SEQ_LEN=$((3 * NUM_KV_PAIRS))
+# zoology uses power_law with 0.01
+QUERY_SAMPLING=${QUERY_SAMPLING:-uniform}
+POWER_A=${POWER_A:-0.01}
+TRAIN_NUM_EXAMPLES=100000
+VALID_NUM_EXAMPLES=3000
+DATA_SEED=123
+
+case "$QUERY_SAMPLING" in
+  uniform)
+    DATA_NAME="mqar_N${NUM_KV_PAIRS}_V${VOCAB_SIZE}_L${INPUT_SEQ_LEN}"
+    ;;
+  power_law)
+    DATA_NAME="mqar_nonuniform_A${POWER_A}_N${NUM_KV_PAIRS}_V${VOCAB_SIZE}_L${INPUT_SEQ_LEN}"
+    ;;
+  zoology)
+    DATA_NAME="mqar_zoology_A${POWER_A}_N${NUM_KV_PAIRS}_V${VOCAB_SIZE}_L${INPUT_SEQ_LEN}"
+    ;;
+  *)
+    echo "QUERY_SAMPLING must be uniform, power_law, or zoology, got: $QUERY_SAMPLING" >&2
+    exit 2
+    ;;
+esac
+
+# For sparse upstream MQAR, add --dense_queries false and set INPUT_SEQ_LEN to
+# at least 4*NUM_KV_PAIRS. query_sampling only controls dense query ordering.
 
 # GradMemGPT specific parameters
 MEMORY_BACKEND="prefix"
@@ -39,14 +57,14 @@ N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
 K=2
 LAST_K_SECOND_ORDER=${K}
-INNER_LR=0.04
+INNER_LR=0.4
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
 GRAD_MODE="second"
 USE_MEM_PROJ=false
 MEM_PROJ_MODE="none"
-USE_WRITE_HEAD=true
+USE_WRITE_HEAD=false
 USE_WRITE_LORA=false
 WRITE_LORA_R=8
 WRITE_LORA_ALPHA=16
@@ -73,9 +91,11 @@ KV_MEM_LAYERS="all"
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
 STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
+STOP_ON_METRIC_VALUE=0.99
+RUN_NAME_SUFFIX=0.99
 
 ATTN_IMPL="eager"
-MIXED_PRECISION='bf16'
+MIXED_PRECISION='no'
 
 # INIT_CHECKPOINT=./runs/N16-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.04_whead_grad_second_bs_64_lr_1e-04/run_1/checkpoint-198000/model.safetensors
 # INIT_CHECKPOINT=./runs/N32-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.12_whead_grad_second_bs_64_lr_1e-04/run_1/checkpoint-196500/model.safetensors
@@ -176,13 +196,19 @@ for N in "${N_VALUES[@]}"; do
       --mixed_precision "$MIXED_PRECISION"
       # --multi_gpu \
       --config_file accelerate.yaml
-    run_gradmemgpt_on_kv_retrieval.py
+    run_gradmemgpt_on_mqar.py
     --exp_path "$EXP_PATH"
     --per_device_batch_size "$PER_DEVICE_BATCH_SIZE"
     --gradient_accumulation_steps "$GRAD_ACC_STEPS"
     --total_batch_size "$TBS"
-    --data_path "$DATA_PATH"
-    --tokenizer_path "$TOKENIZER_PATH"
+    --vocab_size "$VOCAB_SIZE"
+    --input_seq_len "$INPUT_SEQ_LEN"
+    --num_kv_pairs "$NUM_KV_PAIRS"
+    --query_sampling "$QUERY_SAMPLING"
+    --power_a "$POWER_A"
+    --train_num_examples "$TRAIN_NUM_EXAMPLES"
+    --valid_num_examples "$VALID_NUM_EXAMPLES"
+    --data_seed "$DATA_SEED"
     --learning_rate "$LR"
     --n_layer "$L"
     --n_head "$H"
@@ -196,7 +222,7 @@ for N in "${N_VALUES[@]}"; do
     --use_adam "$USE_ADAM"
     --grad_mode "$GRAD_MODE"
     --freeze_backbone "$FREEZE_BACKBONE"
-    --max_steps 1000000
+    --max_steps 200000
     --eval_steps 500
     --logging_steps 500
     --warmup_steps 10000
@@ -223,10 +249,7 @@ for N in "${N_VALUES[@]}"; do
   if [ -n "${ATTN_IMPL:-}" ]; then
     CMD+=( --attn_implementation "$ATTN_IMPL" )
   fi
-  if [ -n "${MAX_CONTEXT_LENGTH:-}" ]; then
-    CMD+=( --max_context_length "$MAX_CONTEXT_LENGTH" )
-  fi
-  
+
   if [ "$USE_WRITE_LORA" = true ]; then
     CMD+=( --use_write_lora )
     CMD+=( --write_lora_r "$WRITE_LORA_R" )

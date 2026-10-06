@@ -121,6 +121,7 @@ For full experiment configurations, use scripts in `scripts/`:
 - `scripts/run_gradmemgpt_on_babi.sh`
 - `scripts/run_gradmemgpt_on_squad.sh`
 
+
 For text-compression experiments, prepare PG19 chunks with
 `scripts/prepare_pg19_chunks.sh` and run `run_gradmemgpt_on_text_compression.py` directly with `accelerate`.
 
@@ -137,6 +138,44 @@ Second-order mode is more expensive in memory/compute, but it is what we found t
 ## Outputs
 
 All runs write checkpoints, metrics, and trainer state under `--exp_path` (typically in `./runs/...`).
+
+
+## Tests
+
+Pytest smoke tests for `GradMemGPT` live in `tests/test_gradmemgpt.py` and cover:
+
+- Model families: `gpt2`, `gpt_neox`, `llama`
+- Memory backends: `prefix`, `lora`
+
+Markers:
+
+- `forward`: fast forward-only checks (`test_forward`)
+- `one_batch_train`: one optimizer step on a single batch (`test_single_batch_train`)
+- `all`: union of `forward` and `one_batch_train`
+
+Examples:
+
+```bash
+# Run all smoke tests (forward + one-batch-train)
+python -m pytest -q -m all
+
+# Run only forward tests
+python -m pytest -q -m forward
+
+# Run only one-batch training tests
+python -m pytest -q -m one_batch_train
+
+# Run tests for selected backend(s) only
+python -m pytest -q -m all --backend prefix
+python -m pytest -q -m all --backend prefix,lora
+
+# Run tests for selected model family/families only
+python -m pytest -q -m all --model-family llama
+python -m pytest -q -m all --model-family gpt2,gpt_neox
+
+# Combine backend + model-family filters
+python -m pytest -q -m all --backend prefix --model-family llama
+```
 
 ## Citation
 ```
