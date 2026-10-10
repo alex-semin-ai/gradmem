@@ -561,8 +561,9 @@ def build_mqar_datasets(
     """Build fixed, disjoint train and validation splits used by the controls."""
     max_seed = 2**32
     np.random.seed(data_seed)
-    train_seed = int(np.random.randint(0, max_seed // 2))
-    valid_seed = int(np.random.randint(max_seed // 2, max_seed))
+    # dtype=np.int64 is the default on Linux; on Windows the default is 32-bit and max_seed would overflow.
+    train_seed = int(np.random.randint(0, max_seed // 2, dtype=np.int64))
+    valid_seed = int(np.random.randint(max_seed // 2, max_seed, dtype=np.int64))
 
     common = {
         "vocab_size": vocab_size,
