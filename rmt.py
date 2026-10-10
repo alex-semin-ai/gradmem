@@ -34,6 +34,7 @@ class RMT2SegmConfig(PretrainedConfig):
                  use_mem_residual=False,
                  use_gradient_checkpointing=False,
                  attn_implementation='eager',
+                 read_loss_alignment='causal',
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -57,7 +58,13 @@ class RMT2SegmConfig(PretrainedConfig):
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.attn_implementation = attn_implementation
+        # "causal": the logit at query position j is scored against the label at j+1 (kv-retrieval, SQuAD).
+        # "query_position": the logit at query position j is scored against the label at j (dense MQAR,
+        # where each answer sits at the position of its own query key, as in GradMem).
+        self.read_loss_alignment = read_loss_alignment
 
+        assert self.read_loss_alignment in ("causal", "query_position"), \
+            f"read_loss_alignment must be one of ['causal','query_position'], got {self.read_loss_alignment}"
         assert self.mem_proj_mode in ["none", "proj", "proj_rw"], \
             f"mem_proj_mode must be one of ['none','proj','proj_rw'], got {self.mem_proj_mode}"
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
@@ -336,9 +343,13 @@ class RMT2Segm(PreTrainedModel):
             return output
 
         # target loss
+        if getattr(self.config, 'read_loss_alignment', 'causal') == 'query_position':
+            target_logits, target_labels = logits_q, labels
+        else:
+            target_logits, target_labels = logits_q[:, :-1], labels[:, 1:]
         target_loss = nn.functional.cross_entropy(
-            logits_q[:, :-1].reshape(-1, logits_q.size(-1)),
-            labels[:, 1:].reshape(-1),
+            target_logits.reshape(-1, logits_q.size(-1)),
+            target_labels.reshape(-1),
             ignore_index=-100,
         )
         output['inner_loop_stats']['target_loss'] = target_loss.detach()
