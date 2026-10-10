@@ -24,6 +24,7 @@ def _tiny_llama_config():
     config.rope_scaling = None
     config.rope_theta = 10000.0
     config.max_position_embeddings = 128
+    config.torch_dtype = "float32"   # as in the training scripts; the Llama-3.2-1B config says bfloat16
     config.vocab_size = VOCAB
     config.pad_token_id = 0
     config.bos_token_id = None
