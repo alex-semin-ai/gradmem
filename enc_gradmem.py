@@ -11,6 +11,15 @@ Plan decisions used here
   D3  M_0 = h_enc, optional identity-initialized projection (E6p)
   D6  encoder reconstruction loss off (E6, E7) or on (E6rec, E7rec)
   C1  frozen encoder (no gradient into the encoder)
+
+Start modes (fix for the scale problem found in the inner-lr sweep, 2026-10-13). The RMT memory h_enc has norm about 100
+(the encoder's final RMSNorm gain times 32), GradMem's memories about 2 to 10, so with M_0 = h_enc the write steps barely
+move the memory. Let d = h_enc / ||h_enc|| (per example, over all memory vectors) and L = start_norm.
+  raw     M_0 = h_enc                       (the original E6 and E7)
+  scaled  M_0 = L * d                       (option A'. The encoder's direction at GradMem's start size)
+  mixed   M_0 = mem + beta * L * d          (option D. GradMem's own start plus the encoder's direction)
+With use_projection the encoder part goes through W x + b (W = I, b = 0 at the start) before mem is added, so the
+scaled projection starts equal to the scaled start (E6p at GradMem's scale).
 """
 import torch
 from torch import nn
@@ -71,9 +80,14 @@ def encoder_write(encoder, context_input_ids, reconstruction_loss=False):
 class EncGradMem(nn.Module):
     """The combined model. Call it like GradMemGPT: forward(input_ids, labels=None, return_mem=False)."""
 
+    START_MODES = ('raw', 'scaled', 'mixed')
+
     def __init__(self, encoder, gradmem, use_projection=False, encoder_reconstruction_loss=False,
-                 reconstruction_loss_weight=1.0, freeze_encoder=False):
+                 reconstruction_loss_weight=1.0, freeze_encoder=False, start_mode='raw', start_norm=None,
+                 mix_beta=1.0):
         super().__init__()
+        if start_mode not in self.START_MODES:
+            raise ValueError(f'start_mode must be one of {self.START_MODES}, not {start_mode!r}')
         if gradmem.memory_backend != 'prefix':
             raise ValueError('EncGradMem needs GradMem with memory_backend prefix')
         if encoder.n_mem_tokens != gradmem.n_mem_tokens:
@@ -97,6 +111,14 @@ class EncGradMem(nn.Module):
             with torch.no_grad():
                 nn.init.eye_(self.proj.weight)
                 self.proj.bias.zero_()
+        self.start_mode = start_mode
+        # L, a fixed number. By default the norm of GradMem's own start vector (E1's mem, about 1.6), the size its
+        # write steps start from in GradMem from E1. gradmem.mem gets no gradient in the raw and scaled modes.
+        # kept as a buffer, so a saved checkpoint restores the L it was trained with
+        self.register_buffer('start_norm_t', torch.tensor(
+            float(gradmem.mem.detach().norm()) if start_norm is None else float(start_norm)))
+        self.mix_beta = float(mix_beta)
+        self.shuffle_start = False   # C3 (evaluation only): each example gets another example's encoder memory
         self.encoder_reconstruction_loss = encoder_reconstruction_loss
         self.reconstruction_loss_weight = reconstruction_loss_weight
         self.freeze_encoder = freeze_encoder
@@ -112,16 +134,30 @@ class EncGradMem(nn.Module):
                                         reconstruction_loss=self.encoder_reconstruction_loss)
         if self.freeze_encoder:
             h_enc = h_enc.detach()
-        start = self.proj(h_enc) if self.proj is not None else h_enc
-        return start, rec_loss
+        if self.shuffle_start and h_enc.size(0) > 1:
+            h_enc = h_enc.roll(1, dims=0)   # a derangement, no example keeps its own memory
+        stats = {'h_enc_norm': h_enc.detach().norm(dim=(1, 2)).mean()}
+        if self.start_mode == 'raw':
+            enc = h_enc
+        else:
+            direction = h_enc / h_enc.norm(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+            enc = self.start_norm_t * direction * (self.mix_beta if self.start_mode == 'mixed' else 1.0)
+        start = self.proj(enc) if self.proj is not None else enc
+        if self.proj is not None:
+            stats['proj_scale'] = (start.detach().norm(dim=(1, 2)) / enc.detach().norm(dim=(1, 2)).clamp_min(1e-6)).mean()
+        if self.start_mode == 'mixed':
+            start = self.gradmem.mem.unsqueeze(0) + start
+        stats['start_norm'] = start.detach().norm(dim=(1, 2)).mean()
+        return start, rec_loss, stats
 
     def forward(self, input_ids, labels=None, return_mem=False):
-        start, rec_loss = self.start_memory(input_ids['context_input_ids'])
+        start, rec_loss, stats = self.start_memory(input_ids['context_input_ids'])
         self.gradmem._start_memory = start
         try:
             out = self.gradmem(input_ids, labels=labels, return_mem=return_mem)
         finally:
             self.gradmem._start_memory = None
+        out['inner_loop_stats'].update(stats)
         if rec_loss is not None:
             out['inner_loop_stats']['enc_rec_loss'] = rec_loss.detach()
             if labels is not None:

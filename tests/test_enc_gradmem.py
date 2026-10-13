@@ -167,3 +167,64 @@ def test_load_parent_rejects_missing_weights():
     bad = {('x' + k): v for k, v in sd.items()}
     with pytest.raises(RuntimeError):
         build(bad)
+
+
+# ---------- start modes (fix for the scale problem) ----------
+
+def start_of(model, b):
+    with torch.no_grad():
+        start, _, stats = model.start_memory(b['input_ids']['context_input_ids'])
+        h_enc, _ = encoder_write(model.encoder, b['input_ids']['context_input_ids'])
+    return start, h_enc, stats
+
+
+def test_scaled_start_keeps_direction_and_sets_length():
+    _, sd = parent_state()
+    m = build(sd, start_mode='scaled', start_norm=1.6)
+    start, h_enc, stats = start_of(m, batch())
+    assert torch.allclose(start.norm(dim=(1, 2)), torch.full((start.size(0),), 1.6), atol=1e-5)
+    cos = (start * h_enc).sum(dim=(1, 2)) / (start.norm(dim=(1, 2)) * h_enc.norm(dim=(1, 2)))
+    assert torch.allclose(cos, torch.ones_like(cos), atol=1e-5)
+    assert abs(stats['start_norm'].item() - 1.6) < 1e-4
+
+
+def test_default_start_norm_is_the_parent_mem_norm_and_is_saved():
+    _, sd = parent_state()
+    m = build(sd, start_mode='scaled')
+    assert abs(m.start_norm_t.item() - sd['mem'].norm().item()) < 1e-5
+    assert 'start_norm_t' in m.state_dict()
+
+
+def test_mixed_start_is_mem_plus_scaled_direction():
+    _, sd = parent_state()
+    m = build(sd, start_mode='mixed', start_norm=2.0, mix_beta=0.5)
+    start, h_enc, _ = start_of(m, batch())
+    d = h_enc / h_enc.norm(dim=(1, 2), keepdim=True)
+    assert torch.allclose(start, m.gradmem.mem.unsqueeze(0) + 0.5 * 2.0 * d, atol=1e-5)
+
+
+def test_projection_at_scaled_start_starts_equal_to_scaled_start():
+    _, sd = parent_state()
+    b = batch()
+    with torch.no_grad():
+        plain = build(sd, start_mode='scaled', start_norm=1.6).eval()(b['input_ids'], labels=b['labels'])
+        proj = build(sd, start_mode='scaled', start_norm=1.6, use_projection=True).eval()(b['input_ids'], labels=b['labels'])
+    assert torch.allclose(plain['loss'], proj['loss'], atol=1e-5)
+    assert abs(proj['inner_loop_stats']['proj_scale'].item() - 1.0) < 1e-5
+
+
+def test_shuffled_start_gives_each_example_another_memory():
+    _, sd = parent_state()
+    m = build(sd, start_mode='scaled', start_norm=1.6)
+    b = batch()
+    start, _, _ = start_of(m, b)
+    m.shuffle_start = True
+    shuffled, _, _ = start_of(m, b)
+    assert torch.allclose(shuffled, start.roll(1, dims=0))
+    assert not torch.allclose(shuffled, start)
+
+
+def test_invalid_start_mode_is_refused():
+    _, sd = parent_state()
+    with pytest.raises(ValueError, match='start_mode'):
+        build(sd, start_mode='half')

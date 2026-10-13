@@ -53,3 +53,18 @@ def test_parent_with_other_memory_size_is_refused(tmp_path):
     args.n_mem_tokens = 3
     with pytest.raises(ValueError, match='memory'):
         S.build_model(args)
+
+
+def test_gradient_norms_by_part():
+    args = parse('--start_mode', 'mixed', '--use_projection', 'true')
+    from pathlib import Path
+    import tempfile
+    tmp = Path(tempfile.mkdtemp())
+    args.init_checkpoint = write_parent(tmp, args)
+    model = S.build_model(args)
+    from tests.test_enc_gradmem import batch   # noqa: E402  (same tiny MQAR batch)
+    b = batch()
+    model.train()(b['input_ids'], labels=b['labels'])['loss'].backward()
+    g = S.grad_norms_by_part(model)
+    assert set(g) == set(S.GRAD_PARTS)
+    assert g['encoder'] > 0 and g['gradmem'] > 0 and g['proj'] > 0 and g['embed'] > 0 and g['mem'] > 0

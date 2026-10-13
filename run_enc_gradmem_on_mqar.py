@@ -33,8 +33,69 @@ from zoology_mqar_data import ZOOLOGY_MQAR_SOURCE, build_mqar_datasets
 
 # the encoder's reconstruction loss is logged with the other loss parts (CustomTrainer and compute_metrics_fn
 # read this list at run time)
-if 'enc_rec_loss' not in G.TRAIN_COMPONENT_KEYS:
-    G.TRAIN_COMPONENT_KEYS.append('enc_rec_loss')
+for _key in ('enc_rec_loss', 'h_enc_norm', 'start_norm', 'proj_scale'):
+    if _key not in G.TRAIN_COMPONENT_KEYS:
+        G.TRAIN_COMPONENT_KEYS.append(_key)
+
+GRAD_PARTS = ('encoder', 'gradmem', 'proj', 'embed', 'mem')
+
+
+def grad_norms_by_part(model):
+    """Gradient norm of each part of the combined model (after clipping, so the shares are what matters).
+    encoder = the encoder transformer, gradmem = GradMem's transformer theta, proj = the projection,
+    embed = the shared token embedding table, mem = the learned start vectors (encoder.mem and gradmem.mem)."""
+    shared = model.gradmem.model.get_input_embeddings().weight
+    sums = dict.fromkeys(GRAD_PARTS, 0.0)
+    seen = set()
+    for name, p in model.named_parameters():
+        if p.grad is None or id(p) in seen:
+            continue
+        seen.add(id(p))
+        if p is shared:
+            part = 'embed'
+        elif name.endswith('.mem') or name == 'mem':
+            part = 'mem'
+        elif name.startswith('proj.'):
+            part = 'proj'
+        elif name.startswith('encoder.'):
+            part = 'encoder'
+        else:
+            part = 'gradmem'
+        sums[part] += float(p.grad.detach().float().pow(2).sum())
+    return {k: v ** 0.5 for k, v in sums.items()}
+
+
+class GradNormsByPart(transformers.TrainerCallback):
+    """Averages grad_norms_by_part over the steps between two training logs."""
+
+    def __init__(self):
+        self.acc, self.n = dict.fromkeys(GRAD_PARTS, 0.0), 0
+
+    def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
+        if model is not None:
+            for k, v in grad_norms_by_part(model).items():
+                self.acc[k] += v
+            self.n += 1
+
+    def pop(self):
+        if not self.n:
+            return {}
+        out = {f'grad_norm_{k}': v / self.n for k, v in self.acc.items()}
+        self.acc, self.n = dict.fromkeys(GRAD_PARTS, 0.0), 0
+        return out
+
+
+class CombinedTrainer(G.CustomTrainer):
+    """The GradMem trainer plus the gradient norm of each part in every training log."""
+
+    def __init__(self, *args, grad_parts=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.grad_parts = grad_parts
+
+    def log(self, logs, start_time=None):
+        if 'loss' in logs and self.grad_parts is not None:
+            logs.update(self.grad_parts.pop())
+        return super().log(logs, start_time=start_time)
 
 
 @dataclass
@@ -46,6 +107,12 @@ class CombinedArgs(G.ExperimentArgs):
     encoder_reconstruction_loss_weight: Optional[float] = field(default=1.0)
     freeze_encoder: Optional[bool] = field(
         default=False, metadata={'help': 'C1. No gradient into the encoder (the shared embedding table still trains)'})
+    start_mode: Optional[str] = field(
+        default='raw', metadata={'help': "raw (M_0 = h_enc), scaled (M_0 = L h_enc/||h_enc||, option A'), "
+                                         "mixed (M_0 = mem + beta L h_enc/||h_enc||, option D)"})
+    start_norm: Optional[float] = field(
+        default=None, metadata={'help': "L for the scaled and mixed starts. Default the norm of the parent's mem"})
+    mix_beta: Optional[float] = field(default=1.0, metadata={'help': 'beta of the mixed start'})
 
 
 def base_llama_config(args):
@@ -137,7 +204,8 @@ def build_model(args, load_parent_weights=True):
     return EncGradMem(encoder, gradmem, use_projection=args.use_projection,
                       encoder_reconstruction_loss=args.encoder_reconstruction_loss,
                       reconstruction_loss_weight=args.encoder_reconstruction_loss_weight,
-                      freeze_encoder=args.freeze_encoder)
+                      freeze_encoder=args.freeze_encoder, start_mode=args.start_mode,
+                      start_norm=args.start_norm, mix_beta=args.mix_beta)
 
 
 if __name__ == '__main__':
@@ -172,7 +240,8 @@ if __name__ == '__main__':
             'train_data_seed': train_data_seed,
             'valid_data_seed': valid_data_seed,
             'init_rmt_checkpoint': args.init_checkpoint,
-            'start_memory': 'W h_enc + b, W = I and b = 0 at the start' if args.use_projection else 'h_enc',
+            'start_mode': args.start_mode, 'start_norm': args.start_norm, 'mix_beta': args.mix_beta,
+            'use_projection': args.use_projection,
             'encoder_reconstruction_loss': args.encoder_reconstruction_loss,
             'freeze_encoder': args.freeze_encoder,
         }
@@ -227,7 +296,9 @@ if __name__ == '__main__':
         seed=args.seed,
     )
 
-    trainer = G.CustomTrainer(
+    grad_parts = GradNormsByPart()
+    trainer = CombinedTrainer(
+        grad_parts=grad_parts,
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -235,7 +306,7 @@ if __name__ == '__main__':
         data_collator=data_collator,
         compute_metrics=G.compute_metrics_fn,
         preprocess_logits_for_metrics=G.preprocess_logits_for_metrics,
-        callbacks=[G.ConsoleEvalMetricsCallback(),
+        callbacks=[G.ConsoleEvalMetricsCallback(), grad_parts,
                    EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
                    G.StopOnMetricValue(metric_name='all_queries_exact_match', value=args.stop_on_metric_value,
                                        higher_is_better=True, consecutive=args.stop_on_metric_consecutive)],

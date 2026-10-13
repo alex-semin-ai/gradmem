@@ -4,6 +4,9 @@ Usage
     python eval_runs.py ~/gradmem_idea3                       all runs in the project folder
     python eval_runs.py ~/gradmem_idea3 --runs E2r_gm_L4_p16_1M_s1 E6_comb_K1_L4_p16_1M_s1
     python eval_runs.py ~/gradmem_idea3 --no_benchmark          test metrics only
+    python eval_runs.py ~/gradmem_idea3 --k_eval 0 1 2 3 --shuffle_start --positions
+        also evaluate with 0..3 write steps, with the encoder memory shuffled across examples (C3, combined runs),
+        and split accuracy by the position of the pair in the context (pairs 1 to 5 against 6 to 16)
 
 Writes results/test_results.json and results/test_results.csv. make_report.py shows them when they exist.
 
@@ -91,7 +94,8 @@ def load_weights(model, ckpt):
     else:
         sd = torch.load(ckpt / 'pytorch_model.bin', map_location='cpu', weights_only=True)
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    missing = [k for k in missing if not k.endswith('lm_head.weight')]   # tied to the embeddings
+    missing = [k for k in missing if not k.endswith('lm_head.weight')   # tied to the embeddings
+               and k != 'start_norm_t']                                  # older combined checkpoints, raw start
     if missing or unexpected:
         raise RuntimeError(f'{ckpt}: {len(missing)} missing and {len(unexpected)} unexpected weights, '
                            f'for example {(missing + unexpected)[:5]}')
@@ -124,10 +128,11 @@ def query_logits(out, labels):
     return logits[:, 1:] if logits.shape[1] == labels.shape[1] + 1 else logits
 
 
-def evaluate(model, batches):
+def evaluate(model, batches, positions=False, suffix=''):
     model.eval()
     correct = total = 0
     em, loss_sum = [], 0.0
+    pos_hits = pos_total = None
     with torch.no_grad():
         for inputs, labels in batches:
             logits = query_logits(model(inputs), labels).float()
@@ -138,8 +143,29 @@ def evaluate(model, batches):
             total += mask.sum().item()
             em += (ok.sum(1) == mask.sum(1)).tolist()
             loss_sum += torch.nn.functional.cross_entropy(logits[mask], labels[mask], reduction='sum').item()
-    return dict(test_token_accuracy=correct / total, test_exact_match=float(np.mean(em)),
-                test_target_loss=loss_sum / total)
+            if positions:
+                keys = inputs['context_input_ids'][:, 0::2]          # key of pair j sits at context position 2j
+                q = inputs['query_input_ids']
+                where = (q.unsqueeze(-1) == keys.unsqueeze(1)).float().argmax(-1)   # pair index of every query
+                if pos_hits is None:
+                    pos_hits, pos_total = torch.zeros(keys.size(1)), torch.zeros(keys.size(1))
+                pos_hits.index_add_(0, where[mask].cpu(), ok[mask].float().cpu())
+                pos_total.index_add_(0, where[mask].cpu(), torch.ones(int(mask.sum())))
+    out = {f'test_token_accuracy{suffix}': correct / total, f'test_exact_match{suffix}': float(np.mean(em)),
+           f'test_target_loss{suffix}': loss_sum / total}
+    if positions:
+        acc = (pos_hits / pos_total.clamp_min(1)).tolist()
+        out[f'test_acc_by_pair{suffix}'] = ' '.join(f'{a:.3f}' for a in acc)
+        out[f'test_acc_pairs_1_5{suffix}'] = float(np.mean(acc[:5]))
+        out[f'test_acc_pairs_6_end{suffix}'] = float(np.mean(acc[5:]))
+    return out
+
+
+def set_write_steps(model, script, k):
+    target = model.gradmem if script == 'run_enc_gradmem_on_mqar.py' else model
+    old = target.K
+    target.K = k
+    return old
 
 
 def timed(fn, device, warmup, reps):
@@ -191,6 +217,11 @@ def main():
     ap.add_argument('--no_benchmark', action='store_true')
     ap.add_argument('--reps', type=int, default=20)
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    ap.add_argument('--k_eval', type=int, nargs='*', default=[],
+                    help='also evaluate GradMem and combined runs with these numbers of write steps')
+    ap.add_argument('--shuffle_start', action='store_true',
+                    help='C3. Also evaluate combined runs with the encoder memory of another example')
+    ap.add_argument('--positions', action='store_true', help='accuracy by the position of the pair in the context')
     a = ap.parse_args()
     proj = Path(a.proj).expanduser()
     device = torch.device(a.device)
@@ -222,7 +253,16 @@ def main():
         row = dict(run=d.name, script=script, checkpoint=ckpt.name, test_seed=a.test_seed,
                    test_data_seed=test_data_seed, n_test=a.n_test,
                    params=sum(p.numel() for p in {id(p): p for p in model.parameters()}.values()),
-                   **evaluate(model, batches))
+                   **evaluate(model, batches, positions=a.positions))
+        if script != 'run_rmt_on_mqar.py':
+            for k in a.k_eval:
+                old = set_write_steps(model, script, k)
+                row.update(evaluate(model, batches, positions=a.positions, suffix=f'_K{k}'))
+                set_write_steps(model, script, old)
+        if a.shuffle_start and script == 'run_enc_gradmem_on_mqar.py':
+            model.shuffle_start = True
+            row.update(evaluate(model, batches, positions=a.positions, suffix='_shuffled'))
+            model.shuffle_start = False
         if not a.no_benchmark:
             row.update(benchmark(model, script, batches, device, a.reps), device=device_name, batch=a.batch)
             inference_mode(model, script)
