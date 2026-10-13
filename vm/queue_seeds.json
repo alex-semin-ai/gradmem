@@ -1,0 +1,111 @@
+{
+ "proj": "~/gradmem_idea3",
+ "gpus": [
+  0,
+  1
+ ],
+ "workers_per_run": 2,
+ "sync_minutes": 5,
+ "allow_size_change": false,
+ "time_limit_hours": null,
+ "min_hours_to_start": 0.5,
+ "conclusions": {},
+ "runs": [
+  {
+   "RUN": "E2r_gm_L4_p16_1M_s2",
+   "NOTE": "E2r seed 144 (fairness fix 7). Set inner_lr to the value chosen by the sweep",
+   "RUN_TYPE": "gradmem",
+   "K": 1,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "seed": 144,
+    "inner_lr": 0.4
+   }
+  },
+  {
+   "RUN": "E3r_gm_L4_p16_1M_s2",
+   "NOTE": "E3r seed 144 (fairness fix 7). Set inner_lr to the value chosen by the sweep",
+   "RUN_TYPE": "gradmem",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "seed": 144,
+    "inner_lr": 0.4
+   }
+  },
+  {
+   "RUN": "E6_comb_K1_L4_p16_1M_s2",
+   "NOTE": "E6 seed 144 (fairness fix 7). Set inner_lr to the value chosen by the sweep",
+   "RUN_TYPE": "combined",
+   "K": 1,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "seed": 144,
+    "inner_lr": 0.4
+   }
+  },
+  {
+   "RUN": "E7_comb_K2_L4_p16_1M_s2",
+   "NOTE": "E7 seed 144 (fairness fix 7). Set inner_lr to the value chosen by the sweep",
+   "RUN_TYPE": "combined",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "seed": 144,
+    "inner_lr": 0.4
+   }
+  },
+  {
+   "RUN": "E2r_gm_L4_p16_1M_s3",
+   "NOTE": "E2r seed 145 (fairness fix 7). Set inner_lr to the value chosen by the sweep",
+   "RUN_TYPE": "gradmem",
+   "K": 1,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "seed": 145,
+    "inner_lr": 0.4
+   }
+  },
+  {
+   "RUN": "E3r_gm_L4_p16_1M_s3",
+   "NOTE": "E3r seed 145 (fairness fix 7). Set inner_lr to the value chosen by the sweep",
+   "RUN_TYPE": "gradmem",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "seed": 145,
+    "inner_lr": 0.4
+   }
+  },
+  {
+   "RUN": "E6_comb_K1_L4_p16_1M_s3",
+   "NOTE": "E6 seed 145 (fairness fix 7). Set inner_lr to the value chosen by the sweep",
+   "RUN_TYPE": "combined",
+   "K": 1,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "seed": 145,
+    "inner_lr": 0.4
+   }
+  },
+  {
+   "RUN": "E7_comb_K2_L4_p16_1M_s3",
+   "NOTE": "E7 seed 145 (fairness fix 7). Set inner_lr to the value chosen by the sweep",
+   "RUN_TYPE": "combined",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "seed": 145,
+    "inner_lr": 0.4
+   }
+  }
+ ]
+}

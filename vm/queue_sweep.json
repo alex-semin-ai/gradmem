@@ -1,0 +1,159 @@
+{
+ "proj": "~/gradmem_idea3",
+ "gpus": [
+  0,
+  1
+ ],
+ "workers_per_run": 2,
+ "sync_minutes": 5,
+ "allow_size_change": false,
+ "time_limit_hours": null,
+ "min_hours_to_start": 0.5,
+ "conclusions": {},
+ "runs": [
+  {
+   "RUN": "S_gm_K1_a0.1_s1",
+   "NOTE": "Inner lr sweep (D7). GradMem K=1 from E1, inner_lr 0.1, 10k steps. inner_lr 0.4 is read from E2r at 10k",
+   "RUN_TYPE": "gradmem",
+   "K": 1,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.1,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_gm_K1_a0.2_s1",
+   "NOTE": "Inner lr sweep (D7). GradMem K=1 from E1, inner_lr 0.2, 10k steps. inner_lr 0.4 is read from E2r at 10k",
+   "RUN_TYPE": "gradmem",
+   "K": 1,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.2,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_gm_K2_a0.1_s1",
+   "NOTE": "Inner lr sweep (D7). GradMem K=2 from E1, inner_lr 0.1, 10k steps. inner_lr 0.4 is read from E3r at 10k",
+   "RUN_TYPE": "gradmem",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.1,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_gm_K2_a0.2_s1",
+   "NOTE": "Inner lr sweep (D7). GradMem K=2 from E1, inner_lr 0.2, 10k steps. inner_lr 0.4 is read from E3r at 10k",
+   "RUN_TYPE": "gradmem",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.2,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_gm_K3_a0.1_s1",
+   "NOTE": "Inner lr sweep (D7). GradMem K=3 from E1, inner_lr 0.1, 10k steps. inner_lr 0.4 is read from E8r at 10k",
+   "RUN_TYPE": "gradmem",
+   "K": 3,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.1,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_gm_K3_a0.2_s1",
+   "NOTE": "Inner lr sweep (D7). GradMem K=3 from E1, inner_lr 0.2, 10k steps. inner_lr 0.4 is read from E8r at 10k",
+   "RUN_TYPE": "gradmem",
+   "K": 3,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.2,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_comb_K1_a0.1_s1",
+   "NOTE": "Inner lr sweep (D7). Combined K=1 from E1, inner_lr 0.1, 10k steps",
+   "RUN_TYPE": "combined",
+   "K": 1,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.1,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_comb_K1_a0.2_s1",
+   "NOTE": "Inner lr sweep (D7). Combined K=1 from E1, inner_lr 0.2, 10k steps",
+   "RUN_TYPE": "combined",
+   "K": 1,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.2,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_comb_K1_a0.4_s1",
+   "NOTE": "Inner lr sweep (D7). Combined K=1 from E1, inner_lr 0.4, 10k steps",
+   "RUN_TYPE": "combined",
+   "K": 1,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.4,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_comb_K2_a0.1_s1",
+   "NOTE": "Inner lr sweep (D7). Combined K=2 from E1, inner_lr 0.1, 10k steps",
+   "RUN_TYPE": "combined",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.1,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_comb_K2_a0.2_s1",
+   "NOTE": "Inner lr sweep (D7). Combined K=2 from E1, inner_lr 0.2, 10k steps",
+   "RUN_TYPE": "combined",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.2,
+    "max_steps": 10000
+   }
+  },
+  {
+   "RUN": "S_comb_K2_a0.4_s1",
+   "NOTE": "Inner lr sweep (D7). Combined K=2 from E1, inner_lr 0.4, 10k steps",
+   "RUN_TYPE": "combined",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.4,
+    "max_steps": 10000
+   }
+  }
+ ]
+}

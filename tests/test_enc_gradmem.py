@@ -141,6 +141,17 @@ def test_encoder_write_matches_rmt():
     assert torch.allclose(mem_rmt, h_enc, atol=1e-6)
 
 
+def test_encoder_reconstruction_loss_equals_rmt_rec_loss():
+    """E6rec and E7rec must train the encoder on exactly the reconstruction loss E1 was trained with."""
+    rmt, _ = parent_state()
+    assert rmt.use_reconstruction_loss
+    b = batch()
+    with torch.no_grad():
+        rmt_rec = rmt(b['input_ids'], labels=b['labels'])['inner_loop_stats']['rec_loss']
+        _, enc_rec = encoder_write(rmt, b['input_ids']['context_input_ids'], reconstruction_loss=True)
+    assert torch.allclose(rmt_rec, enc_rec, atol=1e-5), (rmt_rec, enc_rec)
+
+
 def test_invalid_combinations_are_refused():
     _, sd = parent_state()
     with pytest.raises(ValueError):

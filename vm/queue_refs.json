@@ -1,0 +1,33 @@
+{
+ "proj": "~/gradmem_idea3",
+ "gpus": [
+  0,
+  1
+ ],
+ "workers_per_run": 2,
+ "sync_minutes": 5,
+ "allow_size_change": false,
+ "time_limit_hours": null,
+ "min_hours_to_start": 0.5,
+ "conclusions": {},
+ "runs": [
+  {
+   "RUN": "E2w_gm_L4_p16_1M_s1",
+   "NOTE": "E2 again with the shared warmup 1000 and the 3-in-a-row stop (fairness fix 4)",
+   "RUN_TYPE": "gradmem_reference",
+   "K": 1,
+   "PARENT_RMT_RUN": null,
+   "PARENT_STEP": null,
+   "EXTRA": {}
+  },
+  {
+   "RUN": "E3w_gm_L4_p16_1M_s1",
+   "NOTE": "E3 again with the shared warmup 1000 and the 3-in-a-row stop (fairness fix 4)",
+   "RUN_TYPE": "gradmem_reference",
+   "K": 2,
+   "PARENT_RMT_RUN": null,
+   "PARENT_STEP": null,
+   "EXTRA": {}
+  }
+ ]
+}

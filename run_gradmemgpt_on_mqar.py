@@ -241,21 +241,27 @@ def compute_metrics_fn(eval_pred):
 
 
 class StopOnMetricValue(TrainerCallback):
-    def __init__(self, metric_name: str, value: float, higher_is_better: bool = True):
+    """Stop when the metric reaches the value in `consecutive` evaluations in a row (1 = the first time),
+    so a single lucky evaluation does not end the run."""
+
+    def __init__(self, metric_name: str, value: float, higher_is_better: bool = True, consecutive: int = 1):
         self.metric_name = metric_name
         self.value = value
         self.higher_is_better = higher_is_better
+        self.consecutive = max(1, int(consecutive))
+        self.hits = 0
 
     def on_evaluate(self, args, state, control, metrics, **kwargs):
-        if not self.metric_name.startswith("eval_"):
-            metric_to_check = f"eval_{self.metric_name}"
+        metric_to_check = self.metric_name if self.metric_name.startswith("eval_") else f"eval_{self.metric_name}"
         metric_value = metrics.get(metric_to_check)
         if metric_value is None:
             return
         operator = np.greater_equal if self.higher_is_better else np.less_equal
-        if operator(metric_value, self.value):
+        self.hits = self.hits + 1 if operator(metric_value, self.value) else 0
+        if self.hits >= self.consecutive:
             control.should_training_stop = True
-            logger.info(f'metric {self.metric_name}={metric_value:.4f} >= {self.value:.4f}, stopping training..')
+            logger.info(f'metric {self.metric_name}={metric_value:.4f} >= {self.value:.4f} in {self.hits} '
+                        f'evaluations in a row, stopping training..')
 
 
 class CustomTrainer(Trainer):
@@ -349,6 +355,8 @@ class ExperimentArgs:
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
     stop_on_metric_value: Optional[float] = field(default=1.0)
+    stop_on_metric_consecutive: Optional[int] = field(
+        default=1, metadata={'help': 'evaluations in a row that must reach stop_on_metric_value'})
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
@@ -670,7 +678,7 @@ if __name__ == '__main__':
         callbacks=[ConsoleEvalMetricsCallback(),
                    EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
                    StopOnMetricValue(metric_name='all_queries_exact_match', value=args.stop_on_metric_value,
-                                     higher_is_better=True),
+                                     higher_is_better=True, consecutive=args.stop_on_metric_consecutive),
                    ],
     )
     # Train the model
