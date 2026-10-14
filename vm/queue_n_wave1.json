@@ -1,0 +1,55 @@
+{
+ "proj": "~/gradmem_idea3",
+ "gpus": [
+  0,
+  1
+ ],
+ "workers_per_run": 2,
+ "sync_minutes": 5,
+ "allow_size_change": false,
+ "time_limit_hours": null,
+ "min_hours_to_start": 0.5,
+ "conclusions": {},
+ "runs": [
+  {
+   "RUN": "E3r_a0.1_gm_L4_p16_1M_s1",
+   "NOTE": "N6. E3r again at inner_lr 0.1, the K=2 lr of the combined runs (sweep, section E)",
+   "RUN_TYPE": "gradmem",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.1
+   }
+  },
+  {
+   "RUN": "E8r_a0.1_gm_L4_p16_1M_s1",
+   "NOTE": "N6. E8r again at inner_lr 0.1 (K=3 best at 0.1 in the sweep)",
+   "RUN_TYPE": "gradmem",
+   "K": 3,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {
+    "inner_lr": 0.1
+   }
+  },
+  {
+   "RUN": "E4_rmt_x2_L4_p16_1M_s1",
+   "NOTE": "N8. E4. RMT x2 (two forward passes) started from E1 (16 pairs)",
+   "RUN_TYPE": "rmt",
+   "K": 2,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {}
+  },
+  {
+   "RUN": "E5_rmt_x3_L4_p16_1M_s1",
+   "NOTE": "N8. E5. RMT x3 (three forward passes) started from E1 (16 pairs)",
+   "RUN_TYPE": "rmt",
+   "K": 3,
+   "PARENT_RMT_RUN": "E1_rmt_L4_p16_1M_s1",
+   "PARENT_STEP": 100000,
+   "EXTRA": {}
+  }
+ ]
+}
