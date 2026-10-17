@@ -1,5 +1,5 @@
 """Copy of run_queue.py that also knows RUN_TYPE combined_n (run_enc_gradmem_n_on_mqar.py, N1 and N3)
-and RUN_TYPE fused (run_gradmem_fused_on_mqar.py, the fused write).
+and RUN_TYPE fused and fused_reference (run_gradmem_fused_on_mqar.py, the fused write, from RMT or from scratch).
 
 Train a queue of MQAR runs on this machine, one run per GPU, with resume, logs and results.
 
@@ -137,14 +137,14 @@ def build(spec, q, proj, code):
     elif run_type == 'combined':
         script = 'run_enc_gradmem_on_mqar.py'
         cfg = {**BASE, **dict(memory_backend='prefix', K=k, last_K_second_order=k, inner_lr=0.4, use_adam=False, grad_mode='second', freeze_backbone=False, use_projection=False, encoder_reconstruction_loss=False, encoder_reconstruction_loss_weight=1.0, freeze_encoder=False)}
-    elif run_type == 'fused':
+    elif run_type in ('fused', 'fused_reference'):
         script = 'run_gradmem_fused_on_mqar.py'
         cfg = {**BASE, **dict(memory_backend='prefix', K=k, last_K_second_order=k, inner_lr=0.4, use_adam=False, grad_mode='second', freeze_backbone=False, fused_mode='sum', fused_norm=5.0)}
     elif run_type == 'combined_n':
         script = 'run_enc_gradmem_n_on_mqar.py'
         cfg = {**BASE, **dict(memory_backend='prefix', K=k, last_K_second_order=k, inner_lr=0.4, use_adam=False, grad_mode='second', freeze_backbone=False, use_projection=False, encoder_reconstruction_loss=False, encoder_reconstruction_loss_weight=1.0, freeze_encoder=False, inner_step_scale='none')}
     else:
-        raise ValueError(f"{run}: RUN_TYPE must be 'rmt', 'gradmem', 'gradmem_reference', 'combined', 'combined_n' or 'fused'")
+        raise ValueError(f"{run}: RUN_TYPE must be 'rmt', 'gradmem', 'gradmem_reference', 'combined', 'combined_n', 'fused' or 'fused_reference'")
 
     bad = [key for key in extra if key in SIZE_KEYS and extra[key] != cfg.get(key)]
     if bad and not allow:
@@ -169,8 +169,8 @@ def build(spec, q, proj, code):
 
     if run_type in ('gradmem', 'combined', 'combined_n', 'fused') and not parent:
         raise ValueError(f"{run}: a '{run_type}' run must start from RMT weights. Set PARENT_RMT_RUN (plan, D1, D10).")
-    if run_type == 'gradmem_reference' and parent:
-        raise ValueError(f"{run}: 'gradmem_reference' runs train from scratch. Use RUN_TYPE 'gradmem' to start from RMT.")
+    if run_type in ('gradmem_reference', 'fused_reference') and parent:
+        raise ValueError(f"{run}: 'gradmem_reference' and 'fused_reference' runs train from scratch. Use 'gradmem' or 'fused' to start from RMT.")
     if parent:
         if old is not None and 'init_checkpoint' in old['config']:
             cfg['init_checkpoint'] = old['config']['init_checkpoint']   # a resumed run keeps its original start

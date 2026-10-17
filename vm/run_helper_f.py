@@ -351,7 +351,7 @@ def make_metrics_log(callback_base, path, loss_limit):
 GRADMEM_SCRIPT, RMT_SCRIPT = 'run_gradmemgpt_on_mqar.py', 'run_rmt_on_mqar.py'
 COMBINED_SCRIPT = 'run_enc_gradmem_on_mqar.py'
 COMBINED_N_SCRIPT = 'run_enc_gradmem_n_on_mqar.py'   # combined_n (N1 write-step rule, C4 random start)
-FUSED_SCRIPT = 'run_gradmem_fused_on_mqar.py'         # fused (forward reuse in the write step)
+FUSED_SCRIPT = 'run_gradmem_fused_on_mqar.py'         # fused, fused_reference (forward reuse in the write step)
 
 
 def check_run_type(run_type, script, script_args):
@@ -363,6 +363,7 @@ def check_run_type(run_type, script, script_args):
     combined           encoder + GradMem (Idea 3). Both parts must start from an RMT checkpoint (plan, D1 to D3).
     combined_n         the same with run_enc_gradmem_n_on_mqar.py (N1 write-step rule, C4 random start).
     fused              GradMem with the fused write (run_gradmem_fused_on_mqar.py). Starts from an RMT checkpoint.
+    fused_reference    the fused write from scratch (no init_checkpoint), the fair pair of gradmem_reference.
     The checkpoint's own config.json names the class that saved it, so it shows where the weights come from."""
     if not run_type:
         return None
@@ -405,6 +406,12 @@ def check_run_type(run_type, script, script_args):
         if not init:
             return 'a fused run must start from RMT weights, but no init_checkpoint is given (plan, D1)'
         return rmt_parent_problem()
+    if run_type == 'fused_reference':
+        if Path(script).name != FUSED_SCRIPT:
+            return f'a fused_reference run must use {FUSED_SCRIPT}, not {script}'
+        if init:
+            return 'a fused_reference run trains from scratch, but init_checkpoint is given'
+        return None
     if run_type in ('combined', 'combined_n'):
         expected = COMBINED_SCRIPT if run_type == 'combined' else COMBINED_N_SCRIPT
         if Path(script).name != expected:
