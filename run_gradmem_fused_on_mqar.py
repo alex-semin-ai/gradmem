@@ -62,7 +62,7 @@ ENERGY_LANDSCAPE_STAT_KEYS = [
     "energy_margin_violation_random",
 ]
 
-TRAIN_COMPONENT_KEYS = LOSS_COMPONENT_KEYS + ENERGY_LANDSCAPE_STAT_KEYS + ['fused_f_norm', 'fused_step_ratio']
+TRAIN_COMPONENT_KEYS = LOSS_COMPONENT_KEYS + ENERGY_LANDSCAPE_STAT_KEYS + ['fused_f_norm', 'fused_step_ratio', 'fused_gate', 'polyak_scale', 'focus_plain_loss']
 
 
 class GradMemMQARDataset(torch.utils.data.Dataset):
@@ -401,8 +401,12 @@ class ExperimentArgs:
     write_objective: Optional[str] = field(default="reconstruction")
     fused_mode: Optional[str] = field(
         default='sum', metadata={'help': 'fused write. none (plain GradMem), probe (extra slots, unused, a test), '
-                                         'sum (M = fused_norm F/||F|| - inner_lr grad)'})
+                                         'sum (M = fused_norm F/||F|| - inner_lr grad), ctx_add (gradient step plus '
+                                         'gated attention over the context states), focus (token-weighted write '
+                                         'loss), polyak (Polyak step size)'})
     fused_norm: Optional[float] = field(default=5.0, metadata={'help': 'length of F(M) in the fused update'})
+    fused_focus_gamma: Optional[float] = field(default=1.0, metadata={'help': 'focus. token weight = loss ** gamma'})
+    fused_gate_init: Optional[float] = field(default=-4.0, metadata={'help': 'ctx_add. gate logit at the start'})
     energy_head_hidden_dim: Optional[int] = field(default=None)
     write_reconstruction_weight: Optional[float] = field(default=1.0)
     write_energy_weight: Optional[float] = field(default=1.0)
@@ -481,6 +485,7 @@ if __name__ == '__main__':
             ),
             'init_gradmem_checkpoint': args.init_checkpoint,
             'fused_mode': args.fused_mode, 'fused_norm': args.fused_norm,
+            'fused_focus_gamma': args.fused_focus_gamma, 'fused_gate_init': args.fused_gate_init,
             'metrics': [
                 'token_accuracy',
                 'exact_match',
@@ -589,7 +594,8 @@ if __name__ == '__main__':
                                       read_loss_alignment='query_position',
                                       mqar_vocab_size=args.vocab_size,
                                       mqar_dense_queries=args.dense_queries,
-                                      fused_mode=args.fused_mode, fused_norm=args.fused_norm)
+                                      fused_mode=args.fused_mode, fused_norm=args.fused_norm,
+                                      fused_focus_gamma=args.fused_focus_gamma, fused_gate_init=args.fused_gate_init)
 
     # Create gradmemgpt model
     model = MQARGradMemGPT(gradmem_config)
@@ -599,6 +605,9 @@ if __name__ == '__main__':
     if args.init_checkpoint is not None:
         model_to_init_from_ckpt = model
         state_dict = load_file(args.init_checkpoint)
+        for k, v in model.state_dict().items():   # the ctx_add weights are not in the RMT parent, keep their init
+            if k.split('.')[0] in ('ctx_q', 'ctx_k', 'ctx_v', 'ctx_gate') and k not in state_dict:
+                state_dict[k] = v
         if args.memory_backend == 'prefix' and 'mem' in state_dict and getattr(model, 'mem', None) is not None:
             ckpt_mem = state_dict['mem']
             model_mem = model.mem

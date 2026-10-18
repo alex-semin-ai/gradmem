@@ -6,6 +6,11 @@
 #          loss or its gradient, so probe gives the same memory as none (a test of that claim)
 #   sum    M_{k+1} = fused_norm * F(M_k) / ||F(M_k)|| - inner_lr * grad_M L_write(M_k), per example. F(M_k) comes from
 #          the same forward pass as the write loss, so the RMT-style update costs only the 8 extra tokens
+# The next three keep the full gradient step and add what the same forward pass already computed
+#   ctx_add  M_{k+1} = M_k - lr grad + sigmoid(w) ||M_k|| D/||D||, where D_j attends from memory slot j to the
+#            final hidden states of the context positions (new Wq, Wk, Wv, w). It starts as plain GradMem
+#   focus    the write loss weights each context token by stopgrad(loss_t ** fused_focus_gamma), mean 1
+#   polyak   per-example step size min(lr, L(M_k) / ||grad||^2), the Polyak step from the forward's loss
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -331,7 +336,7 @@ class InputPrefixMemoryBackend(MemoryBackend):
                 [batch_ctx["write_st_batch"], mem_inp, batch_ctx["write_end_batch"], batch_ctx["ctx_emb"]],
                 dim=1,
             )
-        elif o.fused_mode != "none":
+        elif o.fused_mode in ("probe", "sum"):
             # fused write: memory slots also after the context, so their outputs see the whole context
             x_ctx = torch.cat([mem_inp, batch_ctx["ctx_emb"], mem_inp], dim=1)
         else:
@@ -345,7 +350,7 @@ class InputPrefixMemoryBackend(MemoryBackend):
             "label_shift": 0,
             "context_start": batch_ctx["mem_offset"],
         }
-        if o.fused_mode != "none":
+        if o.fused_mode in ("probe", "sum"):
             out["n_tail"] = mem_inp.size(1)
         return out
 
@@ -762,8 +767,17 @@ class GradMemGPT(PreTrainedModel):
         # fused write (see the header of this file)
         self.fused_mode = getattr(config, 'fused_mode', 'none')
         self.fused_norm = getattr(config, 'fused_norm', 5.0)
-        if self.fused_mode not in ('none', 'probe', 'sum'):
-            raise ValueError(f'fused_mode must be none, probe or sum, not {self.fused_mode!r}')
+        self.fused_focus_gamma = getattr(config, 'fused_focus_gamma', 1.0)
+        if self.fused_mode not in ('none', 'probe', 'sum', 'ctx_add', 'focus', 'polyak'):
+            raise ValueError(f'fused_mode must be none, probe, sum, ctx_add, focus or polyak, not {self.fused_mode!r}')
+        if self.fused_mode == 'ctx_add':
+            d = self.model.config.hidden_size
+            self.ctx_q = nn.Linear(d, d, bias=False)
+            self.ctx_k = nn.Linear(d, d, bias=False)
+            self.ctx_v = nn.Linear(d, d, bias=False)
+            with torch.no_grad():
+                self.ctx_v.weight.copy_(torch.eye(d))
+            self.ctx_gate = nn.Parameter(torch.tensor(float(getattr(config, 'fused_gate_init', -4.0))))
         if self.fused_mode != 'none':
             problems = []
             if getattr(config, 'memory_backend', 'prefix') != 'prefix':
@@ -1224,6 +1238,11 @@ class GradMemGPT(PreTrainedModel):
             reduction='none',
         ).view(logits.size(0), -1)
         seq_len = mask_loss.sum(dim=1).clamp_min(1)
+        if self.fused_mode == 'focus':
+            w = loss.detach().clamp_min(0) ** self.fused_focus_gamma * mask_loss
+            w = w * seq_len.unsqueeze(1) / w.sum(1, keepdim=True).clamp_min(1e-12)   # mean weight 1 per example
+            write_batch['focus_plain_loss'] = ((loss * mask_loss).sum(1) / seq_len).detach()
+            loss = loss * w
         loss = (loss * mask_loss).sum(1) / seq_len
         return loss
 
@@ -1245,6 +1264,12 @@ class GradMemGPT(PreTrainedModel):
                               **model_kwargs)
             logits = outs.logits[:, write_batch['logits_start']:-n_tail, :]
             write_batch['fused_new_mem'] = outs.hidden_states[-1][:, -n_tail:]   # after the final RMSNorm, as in RMT
+        elif self.fused_mode == 'ctx_add':
+            outs = self.model(inputs_embeds=write_batch['inputs_embeds'],
+                              return_dict=True, output_hidden_states=True,
+                              **model_kwargs)
+            logits = outs.logits[:, write_batch['logits_start']:, :]
+            write_batch['ctx_hidden'] = outs.hidden_states[-1][:, write_batch['context_start']:]
         else:
             outs = self.model(inputs_embeds=write_batch['inputs_embeds'],
                               return_dict=True,
@@ -1678,8 +1703,8 @@ class GradMemGPT(PreTrainedModel):
                     is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
                     create_graph = is_second_order_step
                     retain_graph = create_graph or (self.add_inner_loss_to_outer and (k == self.K - 1))
-                    if self.fused_mode == "sum":
-                        retain_graph = True   # F(M_k) is built in the same graph and is used after this step
+                    if self.fused_mode in ("sum", "ctx_add"):
+                        retain_graph = True   # F(M_k) or the context states are used after this step
 
                     inner_params = backend.inner_params(memory_state)
                     grads = torch.autograd.grad(inner_loss, inner_params,
@@ -1694,7 +1719,12 @@ class GradMemGPT(PreTrainedModel):
                     inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
 
                     new_params = []
+                    if self.fused_mode == 'polyak':
+                        polyak_scale = (inner_loss_per_sample.detach() / g_sq.detach().clamp_min(1e-12) / self.lr).clamp(max=1.0)
+                        inner_loop_stats['polyak_scale'] = polyak_scale.mean()
                     for p, g, i in zip(inner_params, grads, range(len(inner_params))):
+                        if self.fused_mode == 'polyak':
+                            g = g * polyak_scale.view(-1, *([1] * (g.ndim - 1)))
                         if self.use_adam:
                             p_new = self._adam_step(p, g, opt_state.setdefault(str(i), {}), k + 1, self.lr)
                         else:
@@ -1711,6 +1741,19 @@ class GradMemGPT(PreTrainedModel):
                         inner_loop_stats['fused_f_norm'] = f_norm.detach().mean()
                         inner_loop_stats['fused_step_ratio'] = (
                             step.detach().norm(dim=(1, 2)) / self.fused_norm).mean()
+                    if self.fused_mode == 'ctx_add':
+                        h = write_batch['ctx_hidden']
+                        m = inner_params[0]
+                        ctx_mask = write_batch['mask'][:, -h.size(1):].bool()
+                        att = torch.einsum('bmd,btd->bmt', self.ctx_q(m), self.ctx_k(h)) / math.sqrt(m.size(-1))
+                        att = att.masked_fill(~ctx_mask[:, None, :], float('-inf')).softmax(-1)
+                        delta = torch.einsum('bmt,btd->bmd', att, self.ctx_v(h))
+                        delta = m.detach().norm(dim=(1, 2), keepdim=True) * delta / delta.norm(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+                        gate = torch.sigmoid(self.ctx_gate)
+                        new_params[0] = new_params[0] + gate * delta
+                        inner_loop_stats['fused_gate'] = gate.detach()
+                    if self.fused_mode == 'focus':
+                        inner_loop_stats['focus_plain_loss'] = write_batch['focus_plain_loss'].mean()
                     backend.assign_inner_params(memory_state, new_params)
                     backend.maybe_detach_after_step(memory_state)
 

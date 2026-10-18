@@ -79,6 +79,7 @@ def build(script, cfg):
         a = parse(FU.ExperimentArgs, cfg)
         config = C.gradmem_config_from_args(a, C.base_llama_config(a))
         config.fused_mode, config.fused_norm = a.fused_mode, a.fused_norm
+        config.fused_focus_gamma, config.fused_gate_init = a.fused_focus_gamma, a.fused_gate_init
         return FU.MQARGradMemGPT(config), a
     if script == 'run_enc_gradmem_on_mqar.py':
         a = parse(C.CombinedArgs, cfg)
