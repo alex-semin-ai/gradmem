@@ -189,23 +189,3 @@ python -m pytest -q -m all --backend prefix --model-family llama
       url={https://arxiv.org/abs/2603.13875}, 
 }
 ```
-
-@'
-# GradMem Idea 3, archive of all runs
-
-All runs of the Idea 3 experiments on MQAR (RMT, GradMem, RMT encoder + GradMem, ablations, step sweeps,
-forward reuse variants, seeds, RMT xN at 32 pairs) with configs, logs, metrics, checkpoints and test results.
-128 runs, 4.06 GB. The test table is gradmem_idea3/extras/rmt_p32_vm/results/test_results.csv inside the archive.
-
-The archive is attached to the release idea3-results-v1 in three parts, because GitHub limits a file to 2 GB.
-
-Download and rejoin on Linux or macOS
-
-    gh release download idea3-results-v1 --repo alex-semin-ai/gradmem
-    cat gradmem_all_runs.zip.part0 gradmem_all_runs.zip.part1 gradmem_all_runs.zip.part2 > gradmem_all_runs.zip
-    sha256sum -c gradmem_all_runs.zip.sha256
-
-Rejoin on Windows
-
-    cmd /c copy /b gradmem_all_runs.zip.part0+gradmem_all_runs.zip.part1+gradmem_all_runs.zip.part2 gradmem_all_runs.zip
-'@ | Out-File -Encoding utf8 RESULTS_ARCHIVE.md
